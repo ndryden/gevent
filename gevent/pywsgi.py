@@ -14,6 +14,11 @@ import gevent
 from gevent.server import StreamServer
 from gevent.hub import GreenletExit
 
+have_sendfile = False
+try:
+    from sendfile import sendfile
+    have_sendfile = True
+except ImportError: pass
 
 __all__ = ['WSGIHandler', 'WSGIServer']
 
@@ -161,6 +166,22 @@ class Input(object):
         if not line:
             raise StopIteration
         return line
+
+
+class WSGIFileWrapper(object):
+    """A file wrapper for making use of WSGI's file_wrapper extension."""
+
+    def __init__(self, filelike, block_size = 65535):
+        self.filelike = filelike
+        self.block_size = block_size
+        if hasattr(filelike, 'close'):
+            self.close = filelike.close
+
+    def __getitem__(self, key):
+        data = self.filelike.read(self.block_size)
+        if data:
+            return data
+        raise IndexError
 
 
 class WSGIHandler(object):
@@ -374,6 +395,22 @@ class WSGIHandler(object):
                 raise AssertionError("The application did not call start_response()")
             self._write_with_headers(data)
 
+    def _sendfile(self, fd, block_size):
+        offset = 0
+        while True:
+            try:
+                sent = sendfile(self.socket.fileno(), fd, offset, block_size)
+                if sent == 0:
+                    # EOF.
+                    break
+                offset += sent
+            except OSError:
+                ex = sys.exc_info()[1]
+                if ex[0] == errno.EAGAIN:
+                    socket.wait_write(fd)
+                else:
+                    raise
+
     if sys.version_info[:2] >= (2, 6):
 
         def _write_with_headers(self, data):
@@ -475,9 +512,12 @@ class WSGIHandler(object):
             delta)
 
     def process_result(self):
-        for data in self.result:
-            if data:
-                self.write(data)
+        if isinstance(self.result, WSGIFileWrapper) and have_sendfile and hasattr(self.result.filelike, 'fileno'):
+            self._sendfile(self.result.filelike.fileno(), self.result.block_size)
+        else:
+            for data in self.result:
+                if data:
+                    self.write(data)
         if self.status and not self.headers_sent:
             self.write('')
         if self.response_use_chunked:
@@ -579,6 +619,7 @@ class WSGIHandler(object):
         chunked = env.get('HTTP_TRANSFER_ENCODING', '').lower() == 'chunked'
         self.wsgi_input = Input(self.rfile, self.content_length, socket=socket, chunked_input=chunked)
         env['wsgi.input'] = self.wsgi_input
+        env['wsgi.file_wrapper'] = WSGIFileWrapper
         return env
 
 
